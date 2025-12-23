@@ -615,11 +615,28 @@ impl PromptState {
             }
 
             // Ignore these events
-            EventMsg::AgentReasoningRawContent(..)
-            // In the future we can use this to update usage stats
-            | EventMsg::TokenCount(..)
+            EventMsg::AgentReasoningRawContent(..) => {}
+            EventMsg::TokenCount(event) => {
+                if let Some(info) = event.info {
+                    if let Some(model_ctx_window) = info.model_context_window {
+                        let total_usage = info.total_token_usage;
+                        let blended = total_usage.blended_total();
+                        let remaining = model_ctx_window.saturating_sub(blended);
+                        let used_pct = if model_ctx_window > 0 {
+                            (blended as f64 / model_ctx_window as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        let message = format!(
+                            "Context usage: used {}/{} ({:.1}%); remaining ~{} tokens",
+                            blended, model_ctx_window, used_pct, remaining
+                        );
+                        client.send_agent_text(message).await;
+                    }
+                }
+            }
             // we already have a way to diff the turn, so ignore
-            | EventMsg::TurnDiff(..)
+            EventMsg::TurnDiff(..)
             // Revisit when we can emit status updates
             | EventMsg::BackgroundEvent(..)
             | EventMsg::ContextCompacted(..)
@@ -2087,6 +2104,61 @@ impl<A: Auth> ConversationActor<A> {
         Ok(SessionModelState::new(current_model_id, available_models))
     }
 
+    async fn status_text(&self) -> Result<String, Error> {
+        let cwd = self.config.cwd.display().to_string();
+        let fs_caps = &self.client.client_capabilities.lock().unwrap().fs;
+        let model = self.get_current_model().await;
+        let effort = self
+            .config
+            .model_reasoning_effort
+            .map(|e| format!("{e:?}"))
+            .unwrap_or_else(|| "default".into());
+        let mcp_servers = if self.config.mcp_servers.is_empty() {
+            "none".into()
+        } else {
+            self.config
+                .mcp_servers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Ok(format!(
+            "Status\n- cwd: {cwd}\n- model: {model} (effort: {effort})\n- fs: read_text_file={} write_text_file={}\n- mcp servers: {mcp_servers}",
+            fs_caps.read_text_file, fs_caps.write_text_file
+        ))
+    }
+
+    fn approvals_text(&self) -> String {
+        let preset = format!("{:?}", self.config.approval_policy.value());
+        format!(
+            "Approvals\n- policy: {preset}\n- exec/patch/tool actions still require client permission unless allowed-for-session."
+        )
+    }
+
+    async fn models_text(&self) -> Result<String, Error> {
+        let session_models = self.models().await?;
+        let mut out = String::from("Models\n");
+        for info in session_models.available_models {
+            let current = if info.model_id == session_models.current_model_id {
+                " (current)"
+            } else {
+                ""
+            };
+            out.push_str(&format!("- {}{}\n", info.name, current));
+        }
+        Ok(out.trim_end().to_string())
+    }
+
+    fn parse_model_args(rest: &str) -> Result<(ModelId, Option<String>), Error> {
+        let mut parts = rest.split_whitespace();
+        let model = parts
+            .next()
+            .ok_or_else(|| Error::invalid_params().data("Expected /model <preset> [effort]"))?;
+        let effort = parts.next().map(|s| s.to_string());
+        Ok((ModelId::new(model), effort))
+    }
+
     async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
         Ok(LoadSessionResponse::new()
             .models(self.models().await?)
@@ -2104,6 +2176,37 @@ impl<A: Auth> ConversationActor<A> {
         let op;
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
+                "status" => {
+                    let text = self.status_text().await?;
+                    self.client.send_agent_text(text).await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
+                "approvals" => {
+                    let text = self.approvals_text();
+                    self.client.send_agent_text(text).await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
+                "model" => {
+                    if rest.trim().is_empty() {
+                        let text = self.models_text().await?;
+                        self.client.send_agent_text(text).await;
+                        drop(response_tx.send(Ok(StopReason::EndTurn)));
+                        return Ok(response_rx);
+                    }
+                    let (model, effort) = Self::parse_model_args(rest)?;
+                    self.handle_set_model(model.clone()).await?;
+                    if let Some(effort) = effort {
+                        self.handle_set_config_reasoning_effort(SessionConfigValueId::new(effort))
+                            .await?;
+                    }
+                    self.client
+                        .send_agent_text(format!("Model set to {}", model.0))
+                        .await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
                 "compact" => op = Op::Compact,
                 "undo" => op = Op::Undo,
                 "init" => {
@@ -2484,6 +2587,7 @@ mod tests {
         config::ConfigOverrides, openai_models::model_presets::all_model_presets,
         protocol::AgentMessageEvent,
     };
+    use serde_json;
     use tokio::{
         sync::{Mutex, mpsc::UnboundedSender},
         task::LocalSet,
@@ -2944,6 +3048,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_status_command() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/status".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text.starts_with("Status")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_approvals_command() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/approvals".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text.starts_with("Approvals")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_model_command_list() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/model".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text.starts_with("Models")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_model_command_set() -> anyhow::Result<()> {
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        let preset = all_model_presets()[0].clone();
+        let model_id = preset.id.clone();
+        let effort = serde_json::to_value(preset.default_reasoning_effort)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec![format!("/model {model_id} {effort}").into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text.contains("Model set to")
+        ));
+
+        let ops = conversation.ops.lock().unwrap();
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::OverrideTurnContext { model: Some(m), .. } if m == &model_id)),
+            "Expected model override op"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_delta_deduplication() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -3108,6 +3368,10 @@ mod tests {
                             }),
                         })
                         .unwrap();
+                    return Ok(id.to_string());
+                }
+                Op::OverrideTurnContext { .. } | Op::Interrupt => {
+                    return Ok(id.to_string());
                 }
                 Op::Compact => {
                     self.op_tx
