@@ -340,6 +340,7 @@ struct PromptState {
     active_web_search: Option<String>,
     conversation: Arc<dyn CodexConversationImpl>,
     event_count: usize,
+    context_usage: Option<String>,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     submission_id: String,
     seen_message_deltas: bool,
@@ -357,6 +358,7 @@ impl PromptState {
             active_web_search: None,
             conversation,
             event_count: 0,
+            context_usage: None,
             response_tx: Some(response_tx),
             submission_id,
             seen_message_deltas: false,
@@ -527,6 +529,9 @@ impl PromptState {
                 info!(
                     "Task completed successfully after {} events. Last agent message: {last_agent_message:?}", self.event_count
                 );
+                if let Some(usage) = self.context_usage.take() {
+                    client.send_agent_text(usage).await;
+                }
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
@@ -2588,6 +2593,7 @@ mod tests {
         config::ConfigOverrides, openai_models::model_presets::all_model_presets,
         protocol::AgentMessageEvent,
     };
+    use serde_json;
     use tokio::{
         sync::{Mutex, mpsc::UnboundedSender},
         task::LocalSet,
@@ -3048,6 +3054,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_status_command() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/status".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text.starts_with("Status")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_approvals_command() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/approvals".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text.starts_with("Approvals")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_model_command_list() -> anyhow::Result<()> {
+        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/model".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text.starts_with("Models")
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_model_command_set() -> anyhow::Result<()> {
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+        let preset = all_model_presets()[0].clone();
+        let model_id = preset.id.clone();
+        let effort = serde_json::to_value(preset.default_reasoning_effort)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec![format!("/model {model_id} {effort}").into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text.contains("Model set to")
+        ));
+
+        let ops = conversation.ops.lock().unwrap();
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::OverrideTurnContext { model: Some(m), .. } if m == &model_id)),
+            "Expected model override op"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_delta_deduplication() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -3212,6 +3374,10 @@ mod tests {
                             }),
                         })
                         .unwrap();
+                    return Ok(id.to_string());
+                }
+                Op::OverrideTurnContext { .. } | Op::Interrupt => {
+                    return Ok(id.to_string());
                 }
                 Op::Compact => {
                     self.op_tx
