@@ -636,7 +636,8 @@ impl PromptState {
                             "Context usage: used {}/{} ({:.1}%); remaining ~{} tokens",
                             blended, model_ctx_window, used_pct, remaining
                         );
-                        self.context_usage = Some(message);
+                        // Fallback: emit as a simple agent message chunk
+                        client.send_agent_text(message).await;
                     }
                 }
             }
@@ -2134,11 +2135,11 @@ impl<A: Auth> ConversationActor<A> {
         ))
     }
 
-    fn approvals_text(&self) -> String {
+    async fn approvals_text(&self) -> Result<String, Error> {
         let preset = format!("{:?}", self.config.approval_policy.value());
-        format!(
+        Ok(format!(
             "Approvals\n- policy: {preset}\n- exec/patch/tool actions still require client permission unless allowed-for-session."
-        )
+        ))
     }
 
     async fn models_text(&self) -> Result<String, Error> {
@@ -2188,7 +2189,7 @@ impl<A: Auth> ConversationActor<A> {
                     return Ok(response_rx);
                 }
                 "approvals" => {
-                    let text = self.approvals_text();
+                    let text = self.approvals_text().await?;
                     self.client.send_agent_text(text).await;
                     drop(response_tx.send(Ok(StopReason::EndTurn)));
                     return Ok(response_rx);
@@ -2201,11 +2202,11 @@ impl<A: Auth> ConversationActor<A> {
                         return Ok(response_rx);
                     }
                     let (model, effort) = Self::parse_model_args(rest)?;
-                    self.handle_set_model(model.clone()).await?;
                     if let Some(effort) = effort {
-                        self.handle_set_config_reasoning_effort(SessionConfigValueId::new(effort))
+                        self.handle_set_config_model(SessionConfigValueId::new(effort))
                             .await?;
                     }
+                    self.handle_set_model(model.clone()).await?;
                     self.client
                         .send_agent_text(format!("Model set to {}", model.0))
                         .await;
