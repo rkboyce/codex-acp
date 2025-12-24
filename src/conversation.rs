@@ -340,6 +340,7 @@ struct PromptState {
     active_web_search: Option<String>,
     conversation: Arc<dyn CodexConversationImpl>,
     event_count: usize,
+    context_usage: Option<String>,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     submission_id: String,
     seen_message_deltas: bool,
@@ -357,6 +358,7 @@ impl PromptState {
             active_web_search: None,
             conversation,
             event_count: 0,
+            context_usage: None,
             response_tx: Some(response_tx),
             submission_id,
             seen_message_deltas: false,
@@ -527,6 +529,9 @@ impl PromptState {
                 info!(
                     "Task completed successfully after {} events. Last agent message: {last_agent_message:?}", self.event_count
                 );
+                if let Some(usage) = self.context_usage.take() {
+                    client.send_agent_text(usage).await;
+                }
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
@@ -631,7 +636,7 @@ impl PromptState {
                             "Context usage: used {}/{} ({:.1}%); remaining ~{} tokens",
                             blended, model_ctx_window, used_pct, remaining
                         );
-                        client.send_agent_text(message).await;
+                        self.context_usage = Some(message);
                     }
                 }
             }
