@@ -1,34 +1,44 @@
 use agent_client_protocol::{
-    Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ClientCapabilities, Error, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-    McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities,
-    PromptRequest, PromptResponse, ProtocolVersion, SessionId, SetSessionConfigOptionRequest,
+    Agent, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent, AuthMethodEnvVar,
+    AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
+    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Error, Implementation,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp,
+    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    PromptResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
     SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
-    ConversationManager, NewConversation,
+    CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
     auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
     config::{
         Config,
         types::{McpServerConfig, McpServerTransportConfig},
     },
-    protocol::SessionSource,
+    find_thread_path_by_id_str,
+    models_manager::collaboration_mode_presets::CollaborationModesConfig,
+    parse_cursor,
 };
-use codex_login::{AuthMode, CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
-use codex_protocol::ConversationId;
+use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
+use codex_protocol::{
+    ThreadId,
+    protocol::{InitialHistory, SessionSource},
+};
 use std::{
     cell::RefCell,
     collections::HashMap,
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
 };
 use tracing::{debug, info};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    conversation::Conversation,
     local_spawner::{AcpFs, LocalSpawner},
+    thread::Thread,
 };
 
 /// The Codex implementation of the ACP Agent trait.
@@ -42,11 +52,16 @@ pub struct CodexAgent {
     client_capabilities: Arc<Mutex<ClientCapabilities>>,
     /// The underlying codex configuration
     config: Config,
-    /// Conversation manager for handling sessions
-    conversation_manager: ConversationManager,
+    /// Thread manager for handling sessions
+    thread_manager: ThreadManager,
     /// Active sessions mapped by `SessionId`
-    sessions: Rc<RefCell<HashMap<SessionId, Rc<Conversation>>>>,
+    sessions: Rc<RefCell<HashMap<SessionId, Rc<Thread>>>>,
+    /// Session working directories for filesystem sandboxing
+    session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
 }
+
+const SESSION_LIST_PAGE_SIZE: usize = 25;
+const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
@@ -61,30 +76,40 @@ impl CodexAgent {
 
         let local_spawner = LocalSpawner::new();
         let capabilities_clone = client_capabilities.clone();
-        let conversation_manager =
-            ConversationManager::new(auth_manager.clone(), SessionSource::Unknown).with_fs(
-                Box::new(move |conversation_id| {
-                    Arc::new(AcpFs::new(
-                        Self::session_id_from_conversation_id(conversation_id),
-                        capabilities_clone.clone(),
-                        local_spawner.clone(),
-                    ))
-                }),
-            );
+        let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
+        let session_roots_clone = session_roots.clone();
+        let thread_manager = ThreadManager::new_with_fs(
+            &config,
+            auth_manager.clone(),
+            SessionSource::Unknown,
+            CollaborationModesConfig {
+                // False for now
+                default_mode_request_user_input: false,
+            },
+            Box::new(move |thread_id| {
+                Arc::new(AcpFs::new(
+                    Self::session_id_from_thread_id(thread_id),
+                    capabilities_clone.clone(),
+                    local_spawner.clone(),
+                    session_roots_clone.clone(),
+                ))
+            }),
+        );
         Self {
             auth_manager,
             client_capabilities,
             config,
-            conversation_manager,
+            thread_manager,
             sessions: Rc::default(),
+            session_roots,
         }
     }
 
-    fn session_id_from_conversation_id(conversation_id: ConversationId) -> SessionId {
-        SessionId::new(conversation_id.to_string())
+    fn session_id_from_thread_id(thread_id: ThreadId) -> SessionId {
+        SessionId::new(thread_id.to_string())
     }
 
-    fn get_conversation(&self, session_id: &SessionId) -> Result<Rc<Conversation>, Error> {
+    fn get_thread(&self, session_id: &SessionId) -> Result<Rc<Thread>, Error> {
         Ok(self
             .sessions
             .borrow()
@@ -93,11 +118,105 @@ impl CodexAgent {
             .clone())
     }
 
-    fn check_auth(&self) -> Result<(), Error> {
-        if self.config.model_provider_id == "openai" && self.auth_manager.auth().is_none() {
+    async fn check_auth(&self) -> Result<(), Error> {
+        if self.config.model_provider_id == "openai" && self.auth_manager.auth().await.is_none() {
             return Err(Error::auth_required());
         }
         Ok(())
+    }
+
+    /// Build a session config from base config, working directory, and MCP servers.
+    /// This is shared between `new_session` and `load_session`.
+    fn build_session_config(
+        &self,
+        cwd: &PathBuf,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<Config, Error> {
+        let mut config = self.config.clone();
+        config.include_apply_patch_tool = true;
+        config.cwd.clone_from(cwd);
+
+        // Propagate any client-provided MCP servers that codex-rs supports.
+        let mut new_mcp_servers = config.mcp_servers.get().clone();
+        for mcp_server in mcp_servers {
+            match mcp_server {
+                // Not supported in codex
+                McpServer::Sse(..) => {}
+                McpServer::Http(McpServerHttp {
+                    name, url, headers, ..
+                }) => {
+                    // Codex does not allow whitespace in MCP server names; replace with underscores.
+                    let name = name.replace(|c: char| c.is_whitespace(), "_");
+                    new_mcp_servers.insert(
+                        name,
+                        McpServerConfig {
+                            transport: McpServerTransportConfig::StreamableHttp {
+                                url,
+                                bearer_token_env_var: None,
+                                http_headers: if headers.is_empty() {
+                                    None
+                                } else {
+                                    Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
+                                },
+                                env_http_headers: None,
+                            },
+                            required: false,
+                            enabled: true,
+                            startup_timeout_sec: None,
+                            tool_timeout_sec: None,
+                            disabled_tools: None,
+                            enabled_tools: None,
+                            disabled_reason: None,
+                            scopes: None,
+                            oauth_resource: None,
+                        },
+                    );
+                }
+                McpServer::Stdio(McpServerStdio {
+                    name,
+                    command,
+                    args,
+                    env,
+                    ..
+                }) => {
+                    // Codex does not allow whitespace in MCP server names; replace with underscores.
+                    let name = name.replace(|c: char| c.is_whitespace(), "_");
+                    new_mcp_servers.insert(
+                        name,
+                        McpServerConfig {
+                            transport: McpServerTransportConfig::Stdio {
+                                command: command.display().to_string(),
+                                args,
+                                env: if env.is_empty() {
+                                    None
+                                } else {
+                                    Some(env.into_iter().map(|env| (env.name, env.value)).collect())
+                                },
+                                env_vars: vec![],
+                                cwd: Some(cwd.clone()),
+                            },
+                            required: false,
+                            enabled: true,
+                            startup_timeout_sec: None,
+                            tool_timeout_sec: None,
+                            disabled_tools: None,
+                            enabled_tools: None,
+                            disabled_reason: None,
+                            scopes: None,
+                            oauth_resource: None,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        config
+            .mcp_servers
+            .set(new_mcp_servers)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        Ok(config)
     }
 }
 
@@ -115,9 +234,14 @@ impl Agent for CodexAgent {
 
         *self.client_capabilities.lock().unwrap() = client_capabilities;
 
-        let agent_capabilities = AgentCapabilities::new()
+        let mut agent_capabilities = AgentCapabilities::new()
             .prompt_capabilities(PromptCapabilities::new().embedded_context(true).image(true))
-            .mcp_capabilities(McpCapabilities::new().http(true));
+            .mcp_capabilities(McpCapabilities::new().http(true))
+            .load_session(true);
+
+        agent_capabilities.session_capabilities = SessionCapabilities::new()
+            .close(SessionCloseCapabilities::new())
+            .list(SessionListCapabilities::new());
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -142,13 +266,13 @@ impl Agent for CodexAgent {
         let auth_method = CodexAuthMethod::try_from(request.method_id)?;
 
         // Check before starting login flow if already authenticated with the same method
-        if let Some(auth) = self.auth_manager.auth() {
-            match (auth.mode, auth_method) {
+        if let Some(auth) = self.auth_manager.auth().await {
+            match (auth, auth_method) {
                 (
-                    AuthMode::ApiKey,
+                    CodexAuth::ApiKey(..),
                     CodexAuthMethod::CodexApiKey | CodexAuthMethod::OpenAiApiKey,
                 )
-                | (AuthMode::ChatGPT, CodexAuthMethod::ChatGpt) => {
+                | (CodexAuth::Chatgpt(..), CodexAuthMethod::ChatGpt) => {
                     return Ok(AuthenticateResponse::new());
                 }
                 _ => {}
@@ -206,106 +330,43 @@ impl Agent for CodexAgent {
 
     async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
         // Check before sending if authentication was successful or not
-        self.check_auth()?;
+        self.check_auth().await?;
 
         let NewSessionRequest {
             cwd, mcp_servers, ..
         } = request;
         info!("Creating new session with cwd: {}", cwd.display());
 
-        let mut config = self.config.clone();
-        // Allows us to support HTTP MCP servers
-        config.use_experimental_use_rmcp_client = true;
-        // Make sure we are going through the `apply_patch` code path
-        config.include_apply_patch_tool = true;
-        config.cwd.clone_from(&cwd);
-
-        // Propagate any client-provided MCP servers that codex-rs supports.
-        for mcp_server in mcp_servers {
-            match mcp_server {
-                // Not supported in codex
-                McpServer::Sse(..) => {}
-                McpServer::Http(McpServerHttp {
-                    name, url, headers, ..
-                }) => {
-                    config.mcp_servers.insert(
-                        name,
-                        McpServerConfig {
-                            transport: McpServerTransportConfig::StreamableHttp {
-                                url,
-                                bearer_token_env_var: None,
-                                http_headers: if headers.is_empty() {
-                                    None
-                                } else {
-                                    Some(headers.into_iter().map(|h| (h.name, h.value)).collect())
-                                },
-                                env_http_headers: None,
-                            },
-                            enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
-                            disabled_tools: None,
-                            enabled_tools: None,
-                        },
-                    );
-                }
-                McpServer::Stdio(McpServerStdio {
-                    name,
-                    command,
-                    args,
-                    env,
-                    ..
-                }) => {
-                    config.mcp_servers.insert(
-                        name,
-                        McpServerConfig {
-                            transport: McpServerTransportConfig::Stdio {
-                                command: command.display().to_string(),
-                                args,
-                                env: if env.is_empty() {
-                                    None
-                                } else {
-                                    Some(env.into_iter().map(|env| (env.name, env.value)).collect())
-                                },
-                                env_vars: vec![],
-                                cwd: Some(cwd.clone()),
-                            },
-                            enabled: true,
-                            startup_timeout_sec: None,
-                            tool_timeout_sec: None,
-                            disabled_tools: None,
-                            enabled_tools: None,
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-
+        let config = self.build_session_config(&cwd, mcp_servers)?;
         let num_mcp_servers = config.mcp_servers.len();
 
-        let NewConversation {
-            conversation_id,
-            conversation,
+        let NewThread {
+            thread_id,
+            thread,
             session_configured: _,
-        } = Box::pin(self.conversation_manager.new_conversation(config.clone()))
+        } = Box::pin(self.thread_manager.start_thread(config.clone()))
             .await
             .map_err(|_e| Error::internal_error())?;
 
-        let session_id = Self::session_id_from_conversation_id(conversation_id);
-        let conversation = Rc::new(Conversation::new(
+        let session_id = Self::session_id_from_thread_id(thread_id);
+        // Record the session root for filesystem sandboxing.
+        self.session_roots
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), config.cwd.clone());
+        let thread = Rc::new(Thread::new(
             session_id.clone(),
-            conversation,
+            thread,
             self.auth_manager.clone(),
-            self.conversation_manager.get_models_manager(),
+            self.thread_manager.get_models_manager(),
             self.client_capabilities.clone(),
             config.clone(),
         ));
-        let load = conversation.load().await?;
+        let load = thread.load().await?;
 
         self.sessions
             .borrow_mut()
-            .insert(session_id.clone(), conversation);
+            .insert(session_id.clone(), thread);
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
@@ -321,34 +382,166 @@ impl Agent for CodexAgent {
     ) -> Result<LoadSessionResponse, Error> {
         info!("Loading session: {}", request.session_id);
         // Check before sending if authentication was successful or not
-        self.check_auth()?;
+        self.check_auth().await?;
 
-        // Check if we have this session already
-        let Some(conversation) = self.sessions.borrow().get(&request.session_id).cloned() else {
-            // For now, we can't actually load sessions from disk
-            // The conversation manager doesn't have a direct load method
-            // We would need to use resume_conversation_from_rollout with a rollout path
-            return Err(Error::resource_not_found(None));
+        let LoadSessionRequest {
+            session_id,
+            cwd,
+            mcp_servers,
+            ..
+        } = request;
+
+        let rollout_path =
+            find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?
+                .ok_or_else(|| Error::resource_not_found(None))?;
+
+        let history = RolloutRecorder::get_rollout_history(&rollout_path)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let rollout_items = match &history {
+            InitialHistory::Resumed(resumed) => resumed.history.clone(),
+            InitialHistory::Forked(items) => items.clone(),
+            InitialHistory::New => Vec::new(),
         };
 
-        Ok(conversation.load().await?)
+        let config = self.build_session_config(&cwd, mcp_servers)?;
+
+        let NewThread {
+            thread_id: _,
+            thread,
+            session_configured: _,
+        } = Box::pin(self.thread_manager.resume_thread_from_rollout(
+            config.clone(),
+            rollout_path,
+            self.auth_manager.clone(),
+        ))
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?;
+
+        let thread = Rc::new(Thread::new(
+            session_id.clone(),
+            thread,
+            self.auth_manager.clone(),
+            self.thread_manager.get_models_manager(),
+            self.client_capabilities.clone(),
+            config.clone(),
+        ));
+
+        thread.replay_history(rollout_items).await?;
+
+        let load = thread.load().await?;
+
+        self.session_roots
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), config.cwd);
+        self.sessions.borrow_mut().insert(session_id, thread);
+
+        Ok(LoadSessionResponse::new()
+            .modes(load.modes)
+            .models(load.models)
+            .config_options(load.config_options))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: ListSessionsRequest,
+    ) -> Result<ListSessionsResponse, Error> {
+        self.check_auth().await?;
+
+        let ListSessionsRequest { cwd, cursor, .. } = request;
+        let cursor_obj = cursor.as_deref().and_then(parse_cursor);
+
+        let page = RolloutRecorder::list_threads(
+            &self.config,
+            SESSION_LIST_PAGE_SIZE,
+            cursor_obj.as_ref(),
+            ThreadSortKey::UpdatedAt,
+            &[
+                SessionSource::Cli,
+                SessionSource::VSCode,
+                SessionSource::Unknown,
+            ],
+            None,
+            self.config.model_provider_id.as_str(),
+            None,
+        )
+        .await
+        .map_err(|err| Error::internal_error().data(format!("failed to list sessions: {err}")))?;
+
+        let sessions = page
+            .items
+            .into_iter()
+            .filter_map(|item| {
+                let thread_id = item.thread_id?;
+                let item_cwd = item.cwd?;
+
+                if let Some(filter_cwd) = cwd.as_ref()
+                    && item_cwd != *filter_cwd
+                {
+                    return None;
+                }
+
+                let title = item
+                    .first_user_message
+                    .as_deref()
+                    .and_then(format_session_title);
+                let updated_at = item.updated_at.or(item.created_at);
+
+                Some(
+                    SessionInfo::new(SessionId::new(thread_id.to_string()), item_cwd)
+                        .title(title)
+                        .updated_at(updated_at),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let next_cursor = page
+            .next_cursor
+            .as_ref()
+            .and_then(|next_cursor| serde_json::to_value(next_cursor).ok())
+            .and_then(|value| value.as_str().map(str::to_owned));
+
+        Ok(ListSessionsResponse::new(sessions).next_cursor(next_cursor))
+    }
+
+    async fn close_session(
+        &self,
+        request: CloseSessionRequest,
+    ) -> Result<CloseSessionResponse, Error> {
+        self.get_thread(&request.session_id)?.shutdown().await?;
+        self.thread_manager
+            .remove_thread(
+                &ThreadId::from_string(&request.session_id.0)
+                    .map_err(Error::into_internal_error)?,
+            )
+            .await;
+        self.sessions.borrow_mut().remove(&request.session_id);
+        self.session_roots
+            .lock()
+            .unwrap()
+            .remove(&request.session_id);
+        Ok(CloseSessionResponse::new())
     }
 
     async fn prompt(&self, request: PromptRequest) -> Result<PromptResponse, Error> {
         info!("Processing prompt for session: {}", request.session_id);
         // Check before sending if authentication was successful or not
-        self.check_auth()?;
+        self.check_auth().await?;
 
         // Get the session state
-        let conversation = self.get_conversation(&request.session_id)?;
-        let stop_reason = conversation.prompt(request).await?;
+        let thread = self.get_thread(&request.session_id)?;
+        let stop_reason = thread.prompt(request).await?;
 
         Ok(PromptResponse::new(stop_reason))
     }
 
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
-        self.get_conversation(&args.session_id)?.cancel().await?;
+        self.get_thread(&args.session_id)?.cancel().await?;
         Ok(())
     }
 
@@ -357,7 +550,7 @@ impl Agent for CodexAgent {
         args: SetSessionModeRequest,
     ) -> Result<SetSessionModeResponse, Error> {
         info!("Setting session mode for session: {}", args.session_id);
-        self.get_conversation(&args.session_id)?
+        self.get_thread(&args.session_id)?
             .set_mode(args.mode_id)
             .await?;
         Ok(SetSessionModeResponse::default())
@@ -369,7 +562,7 @@ impl Agent for CodexAgent {
     ) -> Result<SetSessionModelResponse, Error> {
         info!("Setting session model for session: {}", args.session_id);
 
-        self.get_conversation(&args.session_id)?
+        self.get_thread(&args.session_id)?
             .set_model(args.model_id)
             .await?;
 
@@ -381,17 +574,15 @@ impl Agent for CodexAgent {
         args: SetSessionConfigOptionRequest,
     ) -> Result<SetSessionConfigOptionResponse, Error> {
         info!(
-            "Setting session config option for session: {} (config_id: {}, value: {})",
-            args.session_id, args.config_id.0, args.value.0
+            "Setting session config option for session: {} (config_id: {}, value: {:?})",
+            args.session_id, args.config_id.0, args.value
         );
 
-        let conversation = self.get_conversation(&args.session_id)?;
+        let thread = self.get_thread(&args.session_id)?;
 
-        conversation
-            .set_config_option(args.config_id, args.value)
-            .await?;
+        thread.set_config_option(args.config_id, args.value).await?;
 
-        let config_options = conversation.config_options().await?;
+        let config_options = thread.config_options().await?;
 
         Ok(SetSessionConfigOptionResponse::new(config_options))
     }
@@ -417,19 +608,31 @@ impl From<CodexAuthMethod> for AuthMethodId {
 impl From<CodexAuthMethod> for AuthMethod {
     fn from(method: CodexAuthMethod) -> Self {
         match method {
-            CodexAuthMethod::ChatGpt => Self::new(method, "Login with ChatGPT").description(
-                "Use your ChatGPT login with Codex CLI (requires a paid ChatGPT subscription)",
+            CodexAuthMethod::ChatGpt => Self::Agent(
+                AuthMethodAgent::new(method, "Login with ChatGPT").description(
+                    "Use your ChatGPT login with Codex CLI (requires a paid ChatGPT subscription)",
+                ),
             ),
-            CodexAuthMethod::CodexApiKey => {
-                Self::new(method, format!("Use {CODEX_API_KEY_ENV_VAR}")).description(format!(
+            CodexAuthMethod::CodexApiKey => Self::EnvVar(
+                AuthMethodEnvVar::new(
+                    method,
+                    format!("Use {CODEX_API_KEY_ENV_VAR}"),
+                    vec![AuthEnvVar::new(CODEX_API_KEY_ENV_VAR)],
+                )
+                .description(format!(
                     "Requires setting the `{CODEX_API_KEY_ENV_VAR}` environment variable."
-                ))
-            }
-            CodexAuthMethod::OpenAiApiKey => {
-                Self::new(method, format!("Use {OPENAI_API_KEY_ENV_VAR}")).description(format!(
+                )),
+            ),
+            CodexAuthMethod::OpenAiApiKey => Self::EnvVar(
+                AuthMethodEnvVar::new(
+                    method,
+                    format!("Use {OPENAI_API_KEY_ENV_VAR}"),
+                    vec![AuthEnvVar::new(OPENAI_API_KEY_ENV_VAR)],
+                )
+                .description(format!(
                     "Requires setting the `{OPENAI_API_KEY_ENV_VAR}` environment variable."
-                ))
-            }
+                )),
+            ),
         }
     }
 }
@@ -444,5 +647,36 @@ impl TryFrom<AuthMethodId> for CodexAuthMethod {
             "openai-api-key" => Ok(CodexAuthMethod::OpenAiApiKey),
             _ => Err(Error::invalid_params().data("unsupported authentication method")),
         }
+    }
+}
+
+fn truncate_graphemes(text: &str, max_graphemes: usize) -> String {
+    let mut graphemes = text.grapheme_indices(true);
+
+    if let Some((byte_index, _)) = graphemes.nth(max_graphemes) {
+        if max_graphemes >= 3 {
+            let mut truncate_graphemes = text.grapheme_indices(true);
+            if let Some((truncate_byte_index, _)) = truncate_graphemes.nth(max_graphemes - 3) {
+                let truncated = &text[..truncate_byte_index];
+                format!("{truncated}...")
+            } else {
+                text.to_string()
+            }
+        } else {
+            let truncated = &text[..byte_index];
+            truncated.to_string()
+        }
+    } else {
+        text.to_string()
+    }
+}
+
+fn format_session_title(message: &str) -> Option<String> {
+    let normalized = message.replace(['\r', '\n'], " ");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_graphemes(trimmed, SESSION_TITLE_MAX_GRAPHEMES))
     }
 }
